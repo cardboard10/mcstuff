@@ -1,0 +1,27 @@
+#!/usr/bin/python3
+import os
+import urllib.request
+
+
+def download_mrpack_files(mrpack_path, instance_path):
+    import json
+    mrpack=json.load(open(mrpack_path))
+    mrpack_files=mrpack['files']
+    for file in mrpack_files:
+        relative_path = file["path"]
+        url = file["downloads"][0]
+
+        destination = os.path.join(instance_path, relative_path)
+
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+
+        print(f"Downloading {relative_path}...")
+
+        urllib.request.urlretrieve(url, destination)
+
+    print("Done!")
+
+import sys
+args=sys.argv
+if len(args)>1:
+    download_mrpack_files(args[1],args[2])

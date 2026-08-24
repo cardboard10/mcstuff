@@ -1,0 +1,1372 @@
+#!/usr/bin/env python3
+
+import os
+import json
+import shutil
+import subprocess
+import platform
+import tarfile
+import urllib.request
+from pathlib import Path
+from zipfile import ZipFile
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+MC_DIR = Path.home() / "avmc"
+
+MC_VERSION = "1.21.11"
+
+# None = newest stable Fabric Loader
+FABRIC_LOADER_VERSION = None
+
+USERNAME = ""
+ACCESS_TOKEN = ""
+UUID = ""
+
+USER_TYPE = "msa"
+
+MIN_MEMORY = "512M"
+MAX_MEMORY = "2G"
+
+# Java 21
+JAVA_MAJOR = 21
+
+JAVA_DIR = (
+    MC_DIR
+    / "runtime"
+    / f"java-{JAVA_MAJOR}"
+)
+
+
+# ============================================================
+# URLS
+# ============================================================
+
+MOJANG_MANIFEST_URL = (
+    "https://piston-meta.mojang.com/"
+    "mc/game/version_manifest_v2.json"
+)
+
+FABRIC_LOADER_URL = (
+    "https://meta.fabricmc.net/v2/versions/loader"
+)
+
+ADOPTIUM_API = (
+    "https://api.adoptium.net/v3/assets/latest/"
+    f"{JAVA_MAJOR}/hotspot"
+)
+
+
+# ============================================================
+# BASIC HTTP
+# ============================================================
+
+def get_json(url):
+    print(f"[HTTP] {url}")
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "CustomMinecraftLauncher/1.0"
+        }
+    )
+
+    with urllib.request.urlopen(request) as response:
+        return json.loads(
+            response.read().decode("utf-8")
+        )
+
+
+def download(url, dest):
+    dest = Path(dest)
+
+    dest.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    if dest.exists():
+        print(f"[CACHE] {dest}")
+        return
+
+    print(f"[DOWNLOAD] {url}")
+    print(f"           -> {dest}")
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "CustomMinecraftLauncher/1.0"
+        }
+    )
+
+    with urllib.request.urlopen(request) as response:
+        with open(dest, "wb") as f:
+
+            while True:
+                chunk = response.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                f.write(chunk)
+
+
+# ============================================================
+# JAVA
+# ============================================================
+
+def get_java_path():
+    """
+    Returns the Java executable that the launcher should use.
+    """
+
+    # Already installed by this launcher
+    bundled_java = JAVA_DIR / "bin" / "java"
+
+    if bundled_java.exists():
+        return bundled_java
+
+    # Try system Java first
+    system_java = shutil.which("java")
+
+    if system_java:
+        try:
+            result = subprocess.run(
+                [
+                    system_java,
+                    "-version"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            version_output = (
+                result.stdout
+                + result.stderr
+            )
+
+            print(
+                "[JAVA] Found system Java:"
+            )
+            print(version_output.splitlines()[0])
+
+            # We still prefer our own Java 21 runtime
+            # if one has not been installed yet.
+        except Exception:
+            pass
+
+    return None
+
+
+def install_java():
+    """
+    Downloads and installs a Java 21 Temurin runtime.
+    """
+
+    existing = JAVA_DIR / "bin" / "java"
+
+    if existing.exists():
+
+        print()
+        print(
+            f"[JAVA] Java {JAVA_MAJOR} already installed."
+        )
+
+        return existing
+
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if system != "linux":
+        raise RuntimeError(
+            "This automatic Java installer currently "
+            "supports Linux only."
+        )
+
+    if machine not in (
+        "x86_64",
+        "amd64"
+    ):
+        raise RuntimeError(
+            f"Automatic Java installation currently "
+            f"supports Linux x86_64 only. "
+            f"Detected: {machine}"
+        )
+
+    print()
+    print("=" * 60)
+    print(" Installing Java")
+    print("=" * 60)
+
+    # Ask Adoptium for the newest Temurin 21 HotSpot JRE
+    url = (
+        f"{ADOPTIUM_API}"
+        "?architecture=x64"
+        "&image_type=jre"
+        "&os=linux"
+        "&vendor=eclipse"
+        "&project=jdk"
+        "&heap_size=normal"
+        "&release_type=ga"
+    )
+
+    releases = get_json(url)
+
+    if not releases:
+        raise RuntimeError(
+            "Adoptium did not return a Java release."
+        )
+
+    binary = releases[0]["binary"]
+
+    package = binary["package"]
+
+    download_url = package["link"]
+
+    filename = package["name"]
+
+    archive_path = (
+        MC_DIR
+        / "runtime"
+        / filename
+    )
+
+    download(
+        download_url,
+        archive_path
+    )
+
+    # Temporary extraction directory
+    extract_dir = (
+        MC_DIR
+        / "runtime"
+        / ".java_extract"
+    )
+
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+
+    extract_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    print(
+        f"[JAVA] Extracting {archive_path}"
+    )
+
+    with tarfile.open(
+        archive_path,
+        "r:gz"
+    ) as tar:
+
+        tar.extractall(
+            extract_dir
+        )
+
+    # Adoptium archive normally contains:
+    #
+    # jdk-21.x.x+.../
+    #
+    # We move that directory to:
+    #
+    # ~/.minecraft/runtime/java-21/
+
+    extracted_dirs = [
+        p for p in extract_dir.iterdir()
+        if p.is_dir()
+    ]
+
+    if not extracted_dirs:
+        raise RuntimeError(
+            "Could not find Java directory after extraction."
+        )
+
+    java_source = extracted_dirs[0]
+
+    if JAVA_DIR.exists():
+        shutil.rmtree(JAVA_DIR)
+
+    shutil.move(
+        str(java_source),
+        str(JAVA_DIR)
+    )
+
+    # Cleanup
+    shutil.rmtree(
+        extract_dir,
+        ignore_errors=True
+    )
+
+    archive_path.unlink(
+        missing_ok=True
+    )
+
+    java_path = (
+        JAVA_DIR
+        / "bin"
+        / "java"
+    )
+
+    if not java_path.exists():
+        raise RuntimeError(
+            "Java installation completed, but "
+            "the java executable was not found."
+        )
+
+    # Make executable on Linux
+    java_path.chmod(
+        java_path.stat().st_mode | 0o111
+    )
+
+    print(
+        f"[JAVA] Installed Java {JAVA_MAJOR}"
+    )
+
+    print(
+        f"[JAVA] {java_path}"
+    )
+
+    return java_path
+
+
+def ensure_java():
+    java = (
+        JAVA_DIR
+        / "bin"
+        / "java"
+    )
+
+    if java.exists():
+
+        print(
+            f"[JAVA] Using bundled Java:"
+        )
+        print(
+            f"       {java}"
+        )
+
+        return java
+
+    return install_java()
+
+
+# ============================================================
+# JSON
+# ============================================================
+
+def fetch_manifest():
+    return get_json(
+        MOJANG_MANIFEST_URL
+    )
+
+
+def fetch_version_json(version):
+    manifest = fetch_manifest()
+
+    for entry in manifest["versions"]:
+
+        if entry["id"] == version:
+
+            print(
+                f"[VERSION] Found Minecraft {version}"
+            )
+
+            return get_json(
+                entry["url"]
+            )
+
+    raise RuntimeError(
+        f"Minecraft version {version} "
+        f"was not found."
+    )
+
+
+# ============================================================
+# FABRIC
+# ============================================================
+
+def fetch_fabric_profile(mc_version):
+
+    loaders_url = (
+        f"{FABRIC_LOADER_URL}/"
+        f"{mc_version}"
+    )
+
+    loaders = get_json(
+        loaders_url
+    )
+
+    if not loaders:
+        raise RuntimeError(
+            f"No Fabric Loader found for "
+            f"Minecraft {mc_version}"
+        )
+
+    selected = None
+
+    if FABRIC_LOADER_VERSION:
+
+        for entry in loaders:
+
+            loader = entry.get(
+                "loader",
+                {}
+            )
+
+            if (
+                loader.get("version")
+                == FABRIC_LOADER_VERSION
+            ):
+                selected = (
+                    loader["version"]
+                )
+
+                break
+
+        if selected is None:
+            raise RuntimeError(
+                f"Fabric Loader "
+                f"{FABRIC_LOADER_VERSION} "
+                f"was not found."
+            )
+
+    else:
+
+        for entry in loaders:
+
+            loader = entry.get(
+                "loader",
+                {}
+            )
+
+            if loader.get("stable"):
+
+                selected = (
+                    loader.get("version")
+                )
+
+                break
+
+        if selected is None:
+
+            selected = (
+                loaders[0]
+                ["loader"]
+                ["version"]
+            )
+
+    print(
+        f"[FABRIC] Loader: {selected}"
+    )
+
+    profile_url = (
+        f"{FABRIC_LOADER_URL}/"
+        f"{mc_version}/"
+        f"{selected}/"
+        f"profile/json"
+    )
+
+    profile = get_json(
+        profile_url
+    )
+
+    return profile, selected
+
+
+# ============================================================
+# MAVEN
+# ============================================================
+
+def maven_name_to_path(name):
+
+    parts = name.split(":")
+
+    if len(parts) < 3:
+        raise ValueError(
+            f"Invalid Maven name: {name}"
+        )
+
+    group = parts[0]
+    artifact = parts[1]
+    version = parts[2]
+
+    classifier = None
+
+    if len(parts) >= 4:
+        classifier = parts[3]
+
+    filename = (
+        f"{artifact}-{version}"
+    )
+
+    if classifier:
+        filename += (
+            f"-{classifier}"
+        )
+
+    filename += ".jar"
+
+    return (
+        group.replace(".", "/")
+        + "/"
+        + artifact
+        + "/"
+        + version
+        + "/"
+        + filename
+    )
+
+
+# ============================================================
+# RULES
+# ============================================================
+
+def rules_allow(rules):
+
+    allowed = False
+
+    current_os = "linux"
+
+    for rule in rules:
+
+        action = rule.get(
+            "action",
+            "allow"
+        )
+
+        rule_os = rule.get("os")
+
+        matches = True
+
+        if rule_os:
+
+            if "name" in rule_os:
+
+                matches &= (
+                    rule_os["name"]
+                    == current_os
+                )
+
+            if "arch" in rule_os:
+
+                actual = platform.machine()
+
+                if (
+                    rule_os["arch"]
+                    == "x86_64"
+                ):
+                    matches &= (
+                        actual
+                        in (
+                            "x86_64",
+                            "amd64"
+                        )
+                    )
+
+        if matches:
+
+            allowed = (
+                action == "allow"
+            )
+
+    return allowed
+
+
+# ============================================================
+# MINECRAFT LIBRARIES
+# ============================================================
+
+def download_minecraft_libraries(
+    version_json
+):
+
+    libraries = []
+
+    for lib in version_json.get(
+        "libraries",
+        []
+    ):
+
+        rules = lib.get(
+            "rules"
+        )
+
+        if (
+            rules
+            and not rules_allow(rules)
+        ):
+            continue
+
+        downloads = lib.get(
+            "downloads",
+            {}
+        )
+
+        artifact = downloads.get(
+            "artifact"
+        )
+
+        if artifact:
+
+            path = (
+                MC_DIR
+                / "libraries"
+                / artifact["path"]
+            )
+
+            download(
+                artifact["url"],
+                path
+            )
+
+            libraries.append(
+                path
+            )
+
+        # Native libraries
+        classifiers = downloads.get(
+            "classifiers",
+            {}
+        )
+
+        natives = lib.get(
+            "natives",
+            {}
+        )
+
+        if "linux" in natives:
+
+            classifier = natives[
+                "linux"
+            ]
+
+            classifier = classifier.replace(
+                "${arch}",
+                "64"
+            )
+
+            native = classifiers.get(
+                classifier
+            )
+
+            if native:
+
+                native_path = (
+                    MC_DIR
+                    / "libraries"
+                    / native["path"]
+                )
+
+                download(
+                    native["url"],
+                    native_path
+                )
+
+                libraries.append(
+                    native_path
+                )
+
+    return libraries
+
+
+# ============================================================
+# FABRIC LIBRARIES
+# ============================================================
+
+def download_fabric_libraries(
+    profile
+):
+
+    libraries = []
+
+    for lib in profile.get(
+        "libraries",
+        []
+    ):
+
+        name = lib.get(
+            "name"
+        )
+
+        if not name:
+            continue
+
+        path = maven_name_to_path(
+            name
+        )
+
+        repository = lib.get(
+            "url",
+            "https://maven.fabricmc.net/"
+        )
+
+        if not repository.endswith(
+            "/"
+        ):
+            repository += "/"
+
+        url = (
+            repository
+            + path
+        )
+
+        dest = (
+            MC_DIR
+            / "libraries"
+            / path
+        )
+
+        download(
+            url,
+            dest
+        )
+
+        libraries.append(
+            dest
+        )
+
+    return libraries
+
+
+# ============================================================
+# ASSETS
+# ============================================================
+
+def download_assets(
+    version_json
+):
+
+    asset_index = version_json.get(
+        "assetIndex"
+    )
+
+    if not asset_index:
+        return
+
+    index_id = asset_index["id"]
+
+    index_path = (
+        MC_DIR
+        / "assets"
+        / "indexes"
+        / f"{index_id}.json"
+    )
+
+    download(
+        asset_index["url"],
+        index_path
+    )
+
+    with open(
+        index_path,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        index = json.load(f)
+
+    objects = index.get(
+        "objects",
+        {}
+    )
+
+    print(
+        f"[ASSETS] {len(objects)} objects"
+    )
+
+    for obj in objects.values():
+
+        hash_value = obj["hash"]
+
+        prefix = hash_value[:2]
+
+        url = (
+            "https://resources.download.minecraft.net/"
+            f"{prefix}/{hash_value}"
+        )
+
+        dest = (
+            MC_DIR
+            / "assets"
+            / "objects"
+            / prefix
+            / hash_value
+        )
+
+        download(
+            url,
+            dest
+        )
+
+
+# ============================================================
+# VARIABLE SUBSTITUTION
+# ============================================================
+
+def replace_variables(
+    value,
+    variables
+):
+
+    if not isinstance(
+        value,
+        str
+    ):
+        return value
+
+    for key, replacement in (
+        variables.items()
+    ):
+
+        value = value.replace(
+            "${" + key + "}",
+            str(replacement)
+        )
+
+    return value
+
+
+def process_arguments(
+    arguments,
+    variables
+):
+
+    result = []
+
+    for argument in arguments:
+
+        if isinstance(
+            argument,
+            str
+        ):
+
+            result.append(
+                replace_variables(
+                    argument,
+                    variables
+                )
+            )
+
+            continue
+
+        if isinstance(
+            argument,
+            dict
+        ):
+
+            rules = argument.get(
+                "rules"
+            )
+
+            if (
+                rules
+                and not rules_allow(rules)
+            ):
+                continue
+
+            value = argument.get(
+                "value"
+            )
+
+            if isinstance(
+                value,
+                list
+            ):
+
+                for item in value:
+
+                    result.append(
+                        replace_variables(
+                            item,
+                            variables
+                        )
+                    )
+
+            elif isinstance(
+                value,
+                str
+            ):
+
+                result.append(
+                    replace_variables(
+                        value,
+                        variables
+                    )
+                )
+
+    return result
+
+
+# ============================================================
+# CLASSPATH
+# ============================================================
+
+def build_classpath(
+    client_jar,
+    minecraft_libraries,
+    fabric_libraries
+):
+
+    paths = []
+
+    seen = set()
+
+    for path in (
+        minecraft_libraries
+        + fabric_libraries
+    ):
+
+        path = Path(path)
+
+        resolved = str(
+            path.resolve()
+        )
+
+        if resolved in seen:
+            continue
+
+        seen.add(
+            resolved
+        )
+
+        paths.append(
+            resolved
+        )
+
+    paths.append(
+        str(
+            client_jar.resolve()
+        )
+    )
+
+    return ":".join(
+        paths
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 60)
+    print(" Custom Minecraft Fabric Launcher")
+    print("=" * 60)
+
+    print()
+    print(
+        f"Minecraft: {MC_VERSION}"
+    )
+
+    # --------------------------------------------------------
+    # Java
+    # --------------------------------------------------------
+
+    java_path = ensure_java()
+
+    # --------------------------------------------------------
+    # Minecraft
+    # --------------------------------------------------------
+
+    version_json = fetch_version_json(
+        MC_VERSION
+    )
+
+    # --------------------------------------------------------
+    # Fabric
+    # --------------------------------------------------------
+
+    fabric_profile, loader_version = (
+        fetch_fabric_profile(
+            MC_VERSION
+        )
+    )
+
+    main_class = fabric_profile[
+        "mainClass"
+    ]
+
+    print(
+        f"[FABRIC] Main class: "
+        f"{main_class}"
+    )
+
+    # --------------------------------------------------------
+    # Paths
+    # --------------------------------------------------------
+
+    version_dir = (
+        MC_DIR
+        / "versions"
+        / MC_VERSION
+    )
+
+    client_jar = (
+        version_dir
+        / f"{MC_VERSION}.jar"
+    )
+
+    native_dir = (
+        version_dir
+        / "natives"
+    )
+
+    native_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    # --------------------------------------------------------
+    # Client
+    # --------------------------------------------------------
+
+    client = (
+        version_json
+        ["downloads"]
+        ["client"]
+    )
+
+    download(
+        client["url"],
+        client_jar
+    )
+
+    # --------------------------------------------------------
+    # Libraries
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "Downloading Minecraft libraries..."
+    )
+
+    minecraft_libraries = (
+        download_minecraft_libraries(
+            version_json
+        )
+    )
+
+    print()
+    print(
+        "Downloading Fabric libraries..."
+    )
+
+    fabric_libraries = (
+        download_fabric_libraries(
+            fabric_profile
+        )
+    )
+
+    # --------------------------------------------------------
+    # Assets
+    # --------------------------------------------------------
+
+    print()
+    print(
+        "Checking Minecraft assets..."
+    )
+
+    download_assets(
+        version_json
+    )
+
+    # --------------------------------------------------------
+    # Classpath
+    # --------------------------------------------------------
+
+    classpath = build_classpath(
+        client_jar,
+        minecraft_libraries,
+        fabric_libraries
+    )
+
+    # --------------------------------------------------------
+    # Variables
+    # --------------------------------------------------------
+
+    asset_index = (
+        version_json
+        .get("assetIndex", {})
+        .get("id", "")
+    )
+
+    variables = {
+
+        "auth_player_name":
+            USERNAME,
+
+        "auth_uuid":
+            UUID,
+
+        "auth_access_token":
+            ACCESS_TOKEN,
+
+        "user_type":
+            USER_TYPE,
+
+        "version_name":
+            MC_VERSION,
+
+        "version":
+            MC_VERSION,
+
+        "game_directory":
+            str(
+                MC_DIR.resolve()
+            ),
+
+        "assets_root":
+            str(
+                (
+                    MC_DIR
+                    / "assets"
+                ).resolve()
+            ),
+
+        "assets_index_name":
+            asset_index,
+
+        "natives_directory":
+            str(
+                native_dir.resolve()
+            ),
+
+        "library_directory":
+            str(
+                (
+                    MC_DIR
+                    / "libraries"
+                ).resolve()
+            ),
+
+        "classpath":
+            classpath,
+
+        "launcher_name":
+            "CustomLauncher",
+
+        "launcher_version":
+            "1.0",
+
+        "loader_version":
+            loader_version,
+
+        "classpath_separator":
+            ":",
+
+        "user_properties":
+            "{}",
+
+        "user_property_map":
+            "{}",
+
+        "clientid":
+            "",
+
+        "auth_xuid":
+            "",
+
+        "resolution_width":
+            "",
+
+        "resolution_height":
+            "",
+
+        "quickPlayPath":
+            "",
+
+        "quickPlaySingleplayer":
+            "",
+
+        "quickPlayMultiplayer":
+            "",
+
+        "quickPlayRealms":
+            ""
+    }
+
+    # --------------------------------------------------------
+    # JVM arguments
+    # --------------------------------------------------------
+
+    profile_arguments = (
+        fabric_profile.get(
+            "arguments",
+            {}
+        )
+    )
+
+    jvm_args = process_arguments(
+        profile_arguments.get(
+            "jvm",
+            []
+        ),
+        variables
+    )
+
+    # Add memory if necessary
+    if not any(
+        x.startswith("-Xmx")
+        for x in jvm_args
+    ):
+
+        jvm_args.insert(
+            0,
+            f"-Xmx{MAX_MEMORY}"
+        )
+
+    if not any(
+        x.startswith("-Xms")
+        for x in jvm_args
+    ):
+
+        jvm_args.insert(
+            0,
+            f"-Xms{MIN_MEMORY}"
+        )
+
+    # Ensure classpath exists
+    if not any(
+        x in (
+            "-cp",
+            "-classpath"
+        )
+        for x in jvm_args
+    ):
+
+        jvm_args.extend([
+            "-cp",
+            classpath
+        ])
+
+    # --------------------------------------------------------
+    # Game arguments
+    # --------------------------------------------------------
+
+    game_args = process_arguments(
+        profile_arguments.get(
+            "game",
+            []
+        ),
+        variables
+    )
+
+    # --------------------------------------------------------
+    # Final command
+    # --------------------------------------------------------
+
+    command = [
+        str(java_path)
+    ]
+
+    command.extend(
+        jvm_args
+    )
+
+    command.append(
+        main_class
+    )
+
+    command.extend(
+        game_args
+    )
+
+    # --------------------------------------------------------
+    # Print command safely
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 60)
+    print(
+        " Java Launch Command"
+    )
+    print("=" * 60)
+
+    safe_command = []
+
+    for arg in command:
+
+        if (
+            ACCESS_TOKEN
+            and arg == ACCESS_TOKEN
+        ):
+
+            safe_command.append(
+                "<ACCESS_TOKEN>"
+            )
+
+        else:
+
+            safe_command.append(
+                arg
+            )
+
+    print(
+        " ".join(
+            safe_command
+        )
+    )
+
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # Launch
+    # --------------------------------------------------------
+
+    print()
+    print(
+        f"Launching Minecraft "
+        f"{MC_VERSION} "
+        f"with Fabric Loader "
+        f"{loader_version}..."
+    )
+
+    print()
+    #print(command)
+    #command.insert(3,f"--accessToken= {globals()['ACCESS_TOKEN']}")
+    #command.insert(3,f"--username= {globals()['USERNAME']}")
+    #command.insert(3,f"--uuid= {globals()['UUID']}")
+    result = subprocess.run(
+        command,
+        cwd=MC_DIR
+    )
+
+    print()
+    print(
+        f"Minecraft exited with code "
+        f"{result.returncode}"
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nLauncher interrupted."
+        )
+
+    except Exception as e:
+
+        print()
+        print("=" * 60)
+        print(" LAUNCHER ERROR")
+        print("=" * 60)
+        print(e)
+        print()
+
+        raise
